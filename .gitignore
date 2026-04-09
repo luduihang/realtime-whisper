@@ -3,4 +3,7 @@
 __pycache__/
 *.pyc
 run.log
+streamed_buffer*.wav
+mic*.wav
+test.wav
 

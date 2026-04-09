@@ -219,17 +219,26 @@ class RequestBuilder:
         }
 
     @staticmethod
-    def new_full_client_request(seq: int, enable_nonstream: bool) -> bytes:  # 添加seq参数
+    def new_full_client_request(
+        seq: int,
+        enable_nonstream: bool,
+        audio_format: str = "wav",
+        audio_codec: str = "raw",
+    ) -> bytes:  # 添加seq参数
         header = AsrRequestHeader.default_header() \
             .with_message_type_specific_flags(MessageTypeSpecificFlags.POS_SEQUENCE)
         
+        # NOTE:
+        # - 当你发送 WAV 文件字节流（包含 RIFF/WAVE 头）时，audio_format 用 "wav"
+        # - 当你发送麦克风实时采样的裸 PCM（int16 little-endian）时，audio_format 应为 "pcm"/"raw"
+        #   （具体取值以火山文档为准；此处默认 "wav"，由调用方在实时流里覆盖）
         payload = {
             "user": {
                 "uid": "demo_uid"
             },
             "audio": {
-                "format": "wav",
-                "codec": "raw",
+                "format": audio_format,
+                "codec": audio_codec,
                 "rate": 16000,
                 "bits": 16,
                 "channel": 1
@@ -415,7 +424,12 @@ class AsrWsClient:
             
     async def send_full_client_request(self) -> None:
         enable_nonstream = self.url.rstrip("/").endswith("bigmodel_nostream")
-        request = RequestBuilder.new_full_client_request(self.seq, enable_nonstream=enable_nonstream)
+        request = RequestBuilder.new_full_client_request(
+            self.seq,
+            enable_nonstream=enable_nonstream,
+            audio_format="wav",
+            audio_codec="raw",
+        )
         self.seq += 1  # 发送后递增
         try:
             await self.conn.send_bytes(request)

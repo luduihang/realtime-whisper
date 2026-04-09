@@ -74,7 +74,14 @@ class RealtimeAsrStream:
         assert self._ws is not None
 
         enable_nonstream = self.url.rstrip("/").endswith("bigmodel_nostream")
-        req = RequestBuilder.new_full_client_request(self._seq, enable_nonstream=enable_nonstream)
+        # Realtime mic capture produces raw PCM (int16 little-endian), not a WAV container.
+        # So we must declare a non-WAV audio format here (方案 A).
+        req = RequestBuilder.new_full_client_request(
+            self._seq,
+            enable_nonstream=enable_nonstream,
+            audio_format="pcm",
+            audio_codec="raw",
+        )
         self._seq += 1
         await self._ws.send_bytes(req)
 
