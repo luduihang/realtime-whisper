@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import asyncio
-import json
 import os
 import time
 from dataclasses import dataclass
@@ -29,20 +30,30 @@ class DaemonConfig:
 
 class AsrSession:
     """
-    One recording session: mic capture -> websocket -> wait final result.
-    Phase 1 behavior: only return finalText once on stop.
+    One recording session: mic capture -> websocket -> streaming partials + final on stop.
     """
 
-    def __init__(self, *, url: str, resource_id: str, chunk_ms: int):
+    def __init__(
+        self,
+        *,
+        url: str,
+        resource_id: str,
+        chunk_ms: int,
+        daemon: AsrDaemon,
+        session_id: int,
+    ):
         self.url = url
         self.resource_id = resource_id
         self.chunk_ms = chunk_ms
+        self._daemon = daemon
+        self._session_id = session_id
 
         self.fmt = AudioFormat(sample_rate=16000, channels=1, sample_width_bytes=2)
 
         self._seq = 1
         self._stop_event = asyncio.Event()
         self._final_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._last_recv_text: str = ""
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -62,14 +73,12 @@ class AsrSession:
         full_req = RequestBuilder.new_full_client_request(
             self._seq,
             enable_nonstream=enable_nonstream,
-            # Realtime mic capture sends raw PCM int16, not WAV container.
             audio_format="pcm",
             audio_codec="raw",
         )
         self._seq += 1
         await self._ws.send_bytes(full_req)
 
-        # Consume initial response (not used, but keeps protocol aligned)
         msg = await self._ws.receive()
         if msg.type == aiohttp.WSMsgType.BINARY:
             _ = ResponseParser.parse_response(msg.data)
@@ -79,10 +88,12 @@ class AsrSession:
 
     async def stop_and_wait_final(self, timeout_s: float = 8.0) -> str:
         self._stop_event.set()
-
-        # wait final (recv loop will resolve it)
         try:
             return await asyncio.wait_for(self._final_future, timeout=timeout_s)
+        except TimeoutError:
+            if not self._final_future.done():
+                self._final_future.set_result(self._last_recv_text or "")
+            return self._final_future.result()
         finally:
             await self.close()
 
@@ -116,7 +127,6 @@ class AsrSession:
                 await self._ws.send_bytes(req)
                 self._seq += 1
 
-        # Send last packet
         last_req = RequestBuilder.new_audio_only_request(self._seq, b"", is_last=True)
         await self._ws.send_bytes(last_req)
 
@@ -131,7 +141,6 @@ class AsrSession:
 
             resp = ResponseParser.parse_response(msg.data)
 
-            # Error from server
             if resp.code != 0:
                 if not self._final_future.done():
                     self._final_future.set_result("")
@@ -140,14 +149,19 @@ class AsrSession:
             payload = resp.payload_msg or {}
             result = payload.get("result") or {}
             text = result.get("text") or ""
+            self._last_recv_text = text
+            await self._daemon.update_partial(self._session_id, text)
 
-            if resp.is_last_package:
+            if self._stop_event.is_set() and resp.is_last_package:
                 if not self._final_future.done():
                     self._final_future.set_result(text)
                 break
 
         if not self._final_future.done():
-            self._final_future.set_result("")
+            if self._stop_event.is_set():
+                self._final_future.set_result(self._last_recv_text or "")
+            else:
+                self._final_future.set_result("")
 
 
 class AsrDaemon:
@@ -158,29 +172,55 @@ class AsrDaemon:
         self._state: str = "idle"  # idle|recording|stopping
         self._last_final: str = ""
         self._started_at: float = 0.0
+        self._current_session_id: int = 0
+        self._partial_text: str = ""
+        self._partial_seq: int = 0
+
+    async def update_partial(self, session_id: int, text: str) -> None:
+        async with self._lock:
+            if self._session is None or session_id != self._current_session_id:
+                return
+            if text == self._partial_text:
+                return
+            self._partial_text = text
+            self._partial_seq += 1
 
     async def start(self) -> dict:
         async with self._lock:
             if self._state == "recording":
                 return {"ok": True, "state": self._state}
+            if self._state == "stopping":
+                return {"ok": False, "state": self._state, "error": "busy_stopping"}
 
-            self._session = AsrSession(url=self.cfg.url, resource_id=self.cfg.resource_id, chunk_ms=self.cfg.chunk_ms)
+            self._current_session_id += 1
+            sid = self._current_session_id
+            self._partial_text = ""
+            self._partial_seq = 0
+            self._session = AsrSession(
+                url=self.cfg.url,
+                resource_id=self.cfg.resource_id,
+                chunk_ms=self.cfg.chunk_ms,
+                daemon=self,
+                session_id=sid,
+            )
             self._state = "recording"
             self._started_at = time.time()
             await self._session.start()
-            return {"ok": True, "state": self._state}
+            return {"ok": True, "state": self._state, "sessionId": sid}
 
     async def stop(self) -> dict:
         async with self._lock:
             if self._state != "recording" or self._session is None:
                 return {"ok": True, "state": "idle", "finalText": ""}
             self._state = "stopping"
+            stop_id = self._current_session_id
             sess = self._session
 
-        # wait final outside lock
         final = await sess.stop_and_wait_final(timeout_s=12.0)
 
         async with self._lock:
+            if self._current_session_id != stop_id:
+                return {"ok": True, "state": self._state, "finalText": "", "superseded": True}
             self._last_final = final
             self._session = None
             self._state = "idle"
@@ -196,6 +236,16 @@ class AsrDaemon:
                 "chunkMs": self.cfg.chunk_ms,
                 "lastFinal": self._last_final,
                 "startedAt": self._started_at,
+                "partialSeq": self._partial_seq,
+            }
+
+    async def partial_snapshot(self) -> dict:
+        async with self._lock:
+            return {
+                "ok": True,
+                "state": self._state,
+                "text": self._partial_text,
+                "seq": self._partial_seq,
             }
 
 
@@ -208,8 +258,14 @@ def create_app(daemon: AsrDaemon) -> web.Application:
     async def status(_req: web.Request) -> web.Response:
         return web.json_response(await daemon.status())
 
+    async def partial(_req: web.Request) -> web.Response:
+        return web.json_response(await daemon.partial_snapshot())
+
     async def start(_req: web.Request) -> web.Response:
-        return web.json_response(await daemon.start())
+        data = await daemon.start()
+        if data.get("ok") is False:
+            return web.json_response(data, status=409)
+        return web.json_response(data)
 
     async def stop(_req: web.Request) -> web.Response:
         return web.json_response(await daemon.stop())
@@ -218,6 +274,7 @@ def create_app(daemon: AsrDaemon) -> web.Application:
         [
             web.get("/health", health),
             web.get("/status", status),
+            web.get("/partial", partial),
             web.post("/start", start),
             web.post("/stop", stop),
         ]
@@ -234,4 +291,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
