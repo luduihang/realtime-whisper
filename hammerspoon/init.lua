@@ -10,7 +10,7 @@
 --   - on start: call local Python daemon /start
 --   - on stop : call /stop and inject finalText once
 
-hs.console.clearConsole()[wisper] 
+hs.console.clearConsole()
 hs.alert.show("Hammerspoon loaded")
 
 local isRecording = false
